@@ -96,8 +96,7 @@ def construir_sitios_x_configuracion(
     df_config_hw: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Construye el detalle de hardware por sitio, replicando las referencias
-    segun la configuracion asignada y derivando la dimension temporal semanal.
+    Construye el detalle de hardware por sitio, replicando las referencias segun id_configuracion.
     """
     df_cfg = df_config_hw.copy()
 
@@ -135,6 +134,9 @@ def construir_sitios_x_configuracion(
             "referencia",
             "unidad",
             "cantidad_proyectada",
+            "variacion_pasos",
+            "rango_min",
+            "rango_max",
         ]
     ].copy()
 
@@ -160,6 +162,221 @@ def construir_demanda_proyectada_semanal(
 
     return df_demanda
 
+#%%
+# Pedidos de hardware a partir de la demanda proyectada semanal
+
+def _year_week_a_lunes(year_week: str) -> pd.Timestamp:
+    """
+    Convierte un year_week con formato yyyy_ww a la fecha del lunes de esa semana iso.
+    """
+    year_str, week_str = year_week.split("_")
+    year = int(year_str)
+    week = int(week_str)
+    return pd.Timestamp.fromisocalendar(year, week, 1)
+
+
+def _lunes_a_year_week(fecha_lunes: pd.Timestamp) -> str:
+    """
+    Convierte la fecha del lunes de una semana iso al formato yyyy_ww.
+    """
+    iso = fecha_lunes.isocalendar()
+    return f"{int(iso.year)}_{int(iso.week)}"
+
+
+
+#%%
+# Pedidos por bloques a partir de la demanda proyectada semanal
+
+def construir_pedidos_desde_proyeccion(
+    df_demanda_proyectada_semanal: pd.DataFrame,
+    lead_weeks: int = 6,
+    ciclo_weeks: int = 6,
+    cobertura_weeks: int = 6
+) -> pd.DataFrame:
+    """
+    Construye pedidos por bloques.
+
+    Se asume cobertura inicial de semanas 1 a 6.
+    Por tanto:
+    - Pedido semana 1  -> disponible semana 7  -> cubre semanas 7 a 12
+    - Pedido semana 7  -> disponible semana 13 -> cubre semanas 13 a 18
+    - Pedido semana 13 -> disponible semana 19 -> cubre semanas 19 a 24
+    Y asi sucesivamente hasta cubrir todo el horizonte de la demanda proyectada.
+    """
+    df = df_demanda_proyectada_semanal.copy()
+
+    df["fc_week_lunes"] = df["year_week"].apply(_year_week_a_lunes)
+
+    semana_min = df["fc_week_lunes"].min()
+    semana_max = df["fc_week_lunes"].max()
+
+    semanas_calendario = pd.date_range(
+        start=semana_min,
+        end=semana_max,
+        freq="W-MON"
+    )
+
+    idx_pedido = np.arange(0, len(semanas_calendario), ciclo_weeks)
+    semanas_pedido = semanas_calendario[idx_pedido]
+
+    pedidos = []
+
+    for fc_pedido_lunes in semanas_pedido:
+
+        fc_disponible_lunes = fc_pedido_lunes + pd.to_timedelta(lead_weeks * 7, unit="D")
+        fc_fin_ventana = fc_disponible_lunes + pd.to_timedelta((cobertura_weeks - 1) * 7, unit="D")
+
+        df_ventana = df[(df["fc_week_lunes"] >= fc_disponible_lunes) & (df["fc_week_lunes"] <= fc_fin_ventana)].copy()
+
+        if df_ventana.empty:
+            continue
+
+        df_pedido = (
+            df_ventana
+            .groupby(["id_referencia", "referencia", "unidad"], as_index=False)
+            .agg(cantidad_pedido=("cantidad_proyectada", "sum"))
+        )
+
+        df_pedido["year_week_pedido"] = _lunes_a_year_week(fc_pedido_lunes)
+        df_pedido["year_week_disponible"] = _lunes_a_year_week(fc_disponible_lunes)
+
+        df_pedido = df_pedido[
+            [
+                "year_week_pedido",
+                "year_week_disponible",
+                "id_referencia",
+                "referencia",
+                "unidad",
+                "cantidad_pedido"
+            ]
+        ].copy()
+
+        pedidos.append(df_pedido)
+
+    if not pedidos:
+        return pd.DataFrame(
+            columns=[
+                "year_week_pedido",
+                "year_week_disponible",
+                "id_referencia",
+                "referencia",
+                "unidad",
+                "cantidad_pedido"
+            ]
+        )
+
+    df_pedidos = pd.concat(pedidos, ignore_index=True)
+    return df_pedidos
+
+#%%
+# Contaminacion de la cantidad proyectada para simular cantidad real
+
+def _redondear_a_pasos(valor: float, paso: float) -> float:
+    """
+    Redondea un valor al multiplo mas cercano del paso definido.
+    """
+    if paso == 0:
+        return float(valor)
+    return float(np.round(valor / paso) * paso)
+
+
+def _delta_intensidad_discreto(rango_min: float, rango_max: float, paso: float, intensidad: float) -> float:
+    """
+    Genera un delta discreto controlado por intensidad, privilegiando valores cerca de 0.
+    """
+    intensidad = float(np.clip(intensidad, 0.0, 1.0))
+
+    if rango_min > 0 or rango_max < 0:
+        delta = np.random.uniform(rango_min, rango_max)
+        return _redondear_a_pasos(delta, paso)
+
+    max_neg = abs(rango_min)
+    max_pos = abs(rango_max)
+
+    if max_neg == 0 and max_pos == 0:
+        return 0.0
+
+    if max_neg > 0 and max_pos > 0:
+        signo = np.random.choice([-1, 1])
+    elif max_neg > 0:
+        signo = -1
+    else:
+        signo = 1
+
+    if signo == -1:
+        limite = max_neg * intensidad
+        delta = -np.random.uniform(0, limite)
+    else:
+        limite = max_pos * intensidad
+        delta = np.random.uniform(0, limite)
+
+    return _redondear_a_pasos(delta, paso)
+
+
+def contaminar_cantidad_real_por_sitio(
+    df_sitios_x_configuracion: pd.DataFrame,
+    k_min: int = 2,
+    k_max: int = 5,
+    intensidad: float = 0.6,
+    p_extremos: float = 0.15
+) -> pd.DataFrame:
+    """
+    Contamina la cantidad proyectada para simular cantidad real.
+
+    Por cada sitio se selecciona aleatoriamente un numero k de referencias a contaminar.
+    Para cada referencia contaminada se calcula un delta en el rango permitido con pasos definidos,
+    controlando la magnitud con intensidad y dejando una fraccion de eventos extremos.
+    """
+    df = df_sitios_x_configuracion.copy()
+
+    campos_requeridos = ["id_sitio", "cantidad_proyectada", "variacion_pasos", "rango_min", "rango_max"]
+    faltantes = [c for c in campos_requeridos if c not in df.columns]
+    if faltantes:
+        raise ValueError(f"Faltan campos requeridos en el dataframe: {', '.join(faltantes)}")
+
+    df["cantidad_real"] = df["cantidad_proyectada"].astype(float)
+    df["fue_contaminada"] = 0
+
+    for id_sitio, df_site in df.groupby("id_sitio", sort=False):
+        idx_site = df_site.index.to_numpy()
+        n_refs = len(idx_site)
+
+        if n_refs == 0:
+            continue
+
+        k = int(np.random.randint(k_min, k_max + 1))
+        k = min(k, n_refs)
+
+        idx_sel = np.random.choice(idx_site, size=k, replace=False)
+
+        for idx in idx_sel:
+            rmin = float(df.at[idx, "rango_min"])
+            rmax = float(df.at[idx, "rango_max"])
+            paso = float(df.at[idx, "variacion_pasos"])
+            base = float(df.at[idx, "cantidad_proyectada"])
+
+            if np.random.rand() < float(np.clip(p_extremos, 0.0, 1.0)):
+                delta = np.random.uniform(rmin, rmax)
+                delta = _redondear_a_pasos(delta, paso)
+            else:
+                delta = _delta_intensidad_discreto(rmin, rmax, paso, intensidad)
+
+            cantidad_real = base + delta
+            if cantidad_real < 0:
+                cantidad_real = 0.0
+
+            df.at[idx, "cantidad_real"] = cantidad_real
+            df.at[idx, "fue_contaminada"] = 1
+
+    if "unidad" in df.columns:
+        mask_und = df["unidad"].astype(str).str.lower().eq("und")
+        df.loc[mask_und, "cantidad_real"] = df.loc[mask_und, "cantidad_real"].round(0).astype(int)
+        df.loc[~mask_und, "cantidad_real"] = df.loc[~mask_und, "cantidad_real"].astype(float)
+
+    return df
+
+
+
 
 #%%
 # Ejecucion del paso 01
@@ -171,16 +388,43 @@ if __name__ == "__main__":
     ruta_config_hw = "01_simulation/input/configuracion_hw.xlsx"
     ruta_sitios = "01_simulation/input/sitios_proyecto.xlsx"
 
+    # Carga configuracion base de hardware
     df_config_hw = cargar_configuracion_hw(ruta_config_hw)
+
+    # Carga listado base de sitios del proyecto
     df_sitios = cargar_sitios_proyecto(ruta_sitios)
 
+    # Asignacion de configuracion por sitio
     df_sitios = asignar_id_configuracion(df_sitios)
+
+    # Asignacion de altura de antena por sitio
     df_sitios = asignar_altura_antena(df_sitios)
+
+    # Asignacion de fechas de instalacion por sitio
     df_sitios = asignar_fc_instalacion_mensual(df_sitios)
-    
+
+    # Construccion del detalle sitio por referencia
     df_sitios_x_configuracion = construir_sitios_x_configuracion(df_sitios, df_config_hw)
 
+    # Agregacion semanal de demanda proyectada
     df_demanda_proyectada_semanal = construir_demanda_proyectada_semanal(df_sitios_x_configuracion)
+
+    # Construccion del plan de pedidos de hardware
+    df_pedidos = construir_pedidos_desde_proyeccion(
+        df_demanda_proyectada_semanal,
+        lead_weeks=6,
+        cobertura_weeks=7
+    )
+    
+    # Ejecucion de la contaminacion para cantidad real
+
+    df_sitios_x_configuracion_real = contaminar_cantidad_real_por_sitio(
+        df_sitios_x_configuracion,
+        k_min=2,
+        k_max=5,
+        intensidad=0.6,
+        p_extremos=0.15
+    )
 
 
 
@@ -225,4 +469,35 @@ if __name__ == "__main__":
     )
 
     print(f"\nArchivo exportado en {ruta_salida_demanda}")
+    
+#%%
+# Salida para revision del plan de pedidos
+
+    ruta_salida_pedidos = "01_simulation/output/pedidos_desde_proyeccion.xlsx"
+    os.makedirs("01_simulation/output", exist_ok=True)
+
+    df_pedidos.to_excel(
+        ruta_salida_pedidos,
+        index=False,
+        sheet_name="pedidos"
+    )
+
+    print(f"\nArchivo exportado en {ruta_salida_pedidos}")
+    
+    
+#%%
+# Salida para revision del detalle con cantidad real
+
+    ruta_salida_real = "01_simulation/output/sitios_x_configuracion_con_real.xlsx"
+    os.makedirs("01_simulation/output", exist_ok=True)
+
+    df_sitios_x_configuracion_real.to_excel(
+        ruta_salida_real,
+        index=False,
+        sheet_name="sitios_x_configuracion_real"
+    )
+
+    print(f"\nArchivo exportado en {ruta_salida_real}")
+
+
 
