@@ -185,7 +185,7 @@ def _lunes_a_year_week(fecha_lunes: pd.Timestamp) -> str:
 
 
 #%%
-# Pedidos por bloques a partir de la demanda proyectada semanal
+# Pedidos por bloques a partir de la demanda proyectada semanal, incluyendo pedido inicial
 
 def construir_pedidos_desde_proyeccion(
     df_demanda_proyectada_semanal: pd.DataFrame,
@@ -196,8 +196,8 @@ def construir_pedidos_desde_proyeccion(
     """
     Construye pedidos por bloques.
 
-    Se asume cobertura inicial de semanas 1 a 6.
-    Por tanto:
+    Se incluye un pedido inicial antes del inicio del proyecto para dejar disponible HW en la semana 1,
+    cubriendo semanas 1 a 6. Luego se generan pedidos por bloques:
     - Pedido semana 1  -> disponible semana 7  -> cubre semanas 7 a 12
     - Pedido semana 7  -> disponible semana 13 -> cubre semanas 13 a 18
     - Pedido semana 13 -> disponible semana 19 -> cubre semanas 19 a 24
@@ -216,17 +216,52 @@ def construir_pedidos_desde_proyeccion(
         freq="W-MON"
     )
 
+    pedidos = []
+
+    fc_disponible_inicial = semanas_calendario[0]
+    fc_pedido_inicial = fc_disponible_inicial - pd.to_timedelta(lead_weeks * 7, unit="D")
+    fc_fin_ventana_inicial = fc_disponible_inicial + pd.to_timedelta((cobertura_weeks - 1) * 7, unit="D")
+
+    df_ventana_inicial = df[
+        (df["fc_week_lunes"] >= fc_disponible_inicial) &
+        (df["fc_week_lunes"] <= fc_fin_ventana_inicial)
+    ].copy()
+
+    if not df_ventana_inicial.empty:
+        df_pedido_inicial = (
+            df_ventana_inicial
+            .groupby(["id_referencia", "referencia", "unidad"], as_index=False)
+            .agg(cantidad_pedido=("cantidad_proyectada", "sum"))
+        )
+
+        df_pedido_inicial["year_week_pedido"] = _lunes_a_year_week(fc_pedido_inicial)
+        df_pedido_inicial["year_week_disponible"] = _lunes_a_year_week(fc_disponible_inicial)
+
+        df_pedido_inicial = df_pedido_inicial[
+            [
+                "year_week_pedido",
+                "year_week_disponible",
+                "id_referencia",
+                "referencia",
+                "unidad",
+                "cantidad_pedido"
+            ]
+        ].copy()
+
+        pedidos.append(df_pedido_inicial)
+
     idx_pedido = np.arange(0, len(semanas_calendario), ciclo_weeks)
     semanas_pedido = semanas_calendario[idx_pedido]
-
-    pedidos = []
 
     for fc_pedido_lunes in semanas_pedido:
 
         fc_disponible_lunes = fc_pedido_lunes + pd.to_timedelta(lead_weeks * 7, unit="D")
         fc_fin_ventana = fc_disponible_lunes + pd.to_timedelta((cobertura_weeks - 1) * 7, unit="D")
 
-        df_ventana = df[(df["fc_week_lunes"] >= fc_disponible_lunes) & (df["fc_week_lunes"] <= fc_fin_ventana)].copy()
+        df_ventana = df[
+            (df["fc_week_lunes"] >= fc_disponible_lunes) &
+            (df["fc_week_lunes"] <= fc_fin_ventana)
+        ].copy()
 
         if df_ventana.empty:
             continue
@@ -266,7 +301,11 @@ def construir_pedidos_desde_proyeccion(
         )
 
     df_pedidos = pd.concat(pedidos, ignore_index=True)
+
+    df_pedidos["cantidad_pedido"] = df_pedidos["cantidad_pedido"].astype(float)
+
     return df_pedidos
+
 
 #%%
 # Contaminacion de la cantidad proyectada para simular cantidad real
