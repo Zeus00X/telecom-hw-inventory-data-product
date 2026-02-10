@@ -116,7 +116,7 @@ def construir_sitios_x_configuracion(
     df["year_week"] = (
         df["year"].astype(str)
         + "_"
-        + df["week"].astype(str)
+        + df["week"].astype(int).astype(str).str.zfill(2)
     )
 
     df = df[
@@ -180,7 +180,7 @@ def _lunes_a_year_week(fecha_lunes: pd.Timestamp) -> str:
     Convierte la fecha del lunes de una semana iso al formato yyyy_ww.
     """
     iso = fecha_lunes.isocalendar()
-    return f"{int(iso.year)}_{int(iso.week)}"
+    return f"{int(iso.year)}_{int(iso.week):02d}"
 
 
 
@@ -224,7 +224,7 @@ def construir_pedidos_desde_proyeccion(
 
     df_ventana_inicial = df[
         (df["fc_week_lunes"] >= fc_disponible_inicial) &
-        (df["fc_week_lunes"] <= fc_fin_ventana_inicial)
+        (df["fc_week_lunes"] < fc_fin_ventana_inicial)
     ].copy()
 
     if not df_ventana_inicial.empty:
@@ -260,7 +260,7 @@ def construir_pedidos_desde_proyeccion(
 
         df_ventana = df[
             (df["fc_week_lunes"] >= fc_disponible_lunes) &
-            (df["fc_week_lunes"] <= fc_fin_ventana)
+            (df["fc_week_lunes"] < fc_fin_ventana)
         ].copy()
 
         if df_ventana.empty:
@@ -308,7 +308,7 @@ def construir_pedidos_desde_proyeccion(
 
 
 #%%
-# Contaminacion de la cantidad proyectada para simular cantidad real
+# Contaminacion de la cantidad proyectada para simular cantidad real por escenario
 
 def _redondear_a_pasos(valor: float, paso: float) -> float:
     """
@@ -319,52 +319,126 @@ def _redondear_a_pasos(valor: float, paso: float) -> float:
     return float(np.round(valor / paso) * paso)
 
 
-def _delta_intensidad_discreto(rango_min: float, rango_max: float, paso: float, intensidad: float) -> float:
+def _mapear_nivel_a_ratio(nivel: str) -> float:
     """
-    Genera un delta discreto controlado por intensidad, privilegiando valores cerca de 0.
+    Traduce el nivel de severidad a un porcentaje del rango permitido.
     """
-    intensidad = float(np.clip(intensidad, 0.0, 1.0))
+    nivel = str(nivel).strip().lower()
+    if nivel == "bajo":
+        return 0.30
+    if nivel == "medio":
+        return 0.60
+    if nivel == "alto":
+        return 0.90
+    return 0.60
 
-    if rango_min > 0 or rango_max < 0:
-        delta = np.random.uniform(rango_min, rango_max)
-        return _redondear_a_pasos(delta, paso)
 
-    max_neg = abs(rango_min)
-    max_pos = abs(rango_max)
+def _lista_pasos_en_rango(rango_min: float, rango_max: float, paso: float) -> list[float]:
+    """
+    Construye la lista de valores discretos posibles dentro del rango, usando el paso definido.
+    """
+    if paso <= 0:
+        return [float(rango_min), float(rango_max)]
 
-    if max_neg == 0 and max_pos == 0:
+    a = float(rango_min)
+    b = float(rango_max)
+
+    if a > b:
+        a, b = b, a
+
+    inicio = np.ceil(a / paso) * paso
+    fin = np.floor(b / paso) * paso
+
+    if inicio > fin:
+        return [0.0]
+
+    valores = np.arange(inicio, fin + paso, paso, dtype=float)
+    return [float(v) for v in valores]
+
+
+def _filtrar_por_nivel(valores: list[float], nivel: str) -> list[float]:
+    """
+    Filtra la lista de deltas discretos para que el nivel alto solo tome pasos mas alejados de cero.
+    """
+    if not valores:
+        return []
+
+    nivel = str(nivel).strip().lower()
+
+    valores_abs = sorted(valores, key=lambda x: abs(x))
+    n = len(valores_abs)
+
+    if n == 1:
+        return valores_abs
+
+    tercio = max(1, n // 3)
+    bajos = valores_abs[:tercio]
+    medios = valores_abs[tercio:2 * tercio]
+    altos = valores_abs[2 * tercio:]
+
+    if nivel == "bajo":
+        return bajos
+    if nivel == "medio":
+        return medios if medios else bajos
+    if nivel == "alto":
+        return altos if altos else medios if medios else bajos
+
+    return valores
+
+
+def _delta_discreto_por_escenario(
+    rango_min: float,
+    rango_max: float,
+    paso: float,
+    modo: str,
+    nivel: str
+) -> float:
+    """
+    Genera un delta discreto segun modo y nivel, eligiendo al azar solo entre los pasos del nivel.
+    """
+    modo = str(modo).strip().lower()
+    ratio = _mapear_nivel_a_ratio(nivel)
+
+    rmin = float(rango_min)
+    rmax = float(rango_max)
+
+    if modo == "faltantes":
+        limite = max(0.0, rmax * ratio)
+        valores = _lista_pasos_en_rango(0.0, limite, paso)
+        valores = [v for v in valores if v >= 0]
+
+    elif modo == "sobrantes":
+        limite = min(0.0, rmin * ratio)
+        valores = _lista_pasos_en_rango(limite, 0.0, paso)
+        valores = [v for v in valores if v <= 0]
+
+    else:
+        lim_neg = min(0.0, rmin * ratio)
+        lim_pos = max(0.0, rmax * ratio)
+        valores = _lista_pasos_en_rango(lim_neg, lim_pos, paso)
+
+    valores_nivel = _filtrar_por_nivel(valores, nivel)
+
+    if not valores_nivel:
         return 0.0
 
-    if max_neg > 0 and max_pos > 0:
-        signo = np.random.choice([-1, 1])
-    elif max_neg > 0:
-        signo = -1
-    else:
-        signo = 1
-
-    if signo == -1:
-        limite = max_neg * intensidad
-        delta = -np.random.uniform(0, limite)
-    else:
-        limite = max_pos * intensidad
-        delta = np.random.uniform(0, limite)
-
-    return _redondear_a_pasos(delta, paso)
+    return float(np.random.choice(valores_nivel))
 
 
 def contaminar_cantidad_real_por_sitio(
     df_sitios_x_configuracion: pd.DataFrame,
     k_min: int = 2,
     k_max: int = 5,
-    intensidad: float = 0.6,
-    p_extremos: float = 0.15
+    modo: str = "sobrantes",
+    nivel: str = "medio"
 ) -> pd.DataFrame:
     """
     Contamina la cantidad proyectada para simular cantidad real.
 
     Por cada sitio se selecciona aleatoriamente un numero k de referencias a contaminar.
-    Para cada referencia contaminada se calcula un delta en el rango permitido con pasos definidos,
-    controlando la magnitud con intensidad y dejando una fraccion de eventos extremos.
+    Para cada referencia contaminada se calcula un delta discreto segun el escenario:
+    - modo: faltantes, sobrantes o aleatorio
+    - nivel: bajo, medio o alto
     """
     df = df_sitios_x_configuracion.copy()
 
@@ -394,11 +468,13 @@ def contaminar_cantidad_real_por_sitio(
             paso = float(df.at[idx, "variacion_pasos"])
             base = float(df.at[idx, "cantidad_proyectada"])
 
-            if np.random.rand() < float(np.clip(p_extremos, 0.0, 1.0)):
-                delta = np.random.uniform(rmin, rmax)
-                delta = _redondear_a_pasos(delta, paso)
-            else:
-                delta = _delta_intensidad_discreto(rmin, rmax, paso, intensidad)
+            delta = _delta_discreto_por_escenario(
+                rango_min=rmin,
+                rango_max=rmax,
+                paso=paso,
+                modo=modo,
+                nivel=nivel
+            )
 
             cantidad_real = base + delta
             if cantidad_real < 0:
@@ -457,20 +533,22 @@ if __name__ == "__main__":
     
     # Ejecucion de la contaminacion para cantidad real
 
+  # Ejecucion de la contaminacion para cantidad real
     df_sitios_x_configuracion_real = contaminar_cantidad_real_por_sitio(
         df_sitios_x_configuracion,
         k_min=2,
         k_max=5,
-        intensidad=0.6,
-        p_extremos=0.15
+        modo="faltantes",
+        nivel="medio"
     )
+
 
 
 
 #%%
 # Salida para revision en excel
 
-    ruta_salida = "01_simulation/output/sitios_proyecto_enriquecido.xlsx"
+    ruta_salida = "01_simulation/output/01_sitios_proyecto_enriquecido.xlsx"
     os.makedirs("01_simulation/output", exist_ok=True)
 
     df_sitios.to_excel(
@@ -484,7 +562,7 @@ if __name__ == "__main__":
 #%%
 # Salida para revision del detalle sitio por referencia
 
-    ruta_salida_detalle = "01_simulation/output/sitios_x_configuracion.xlsx"
+    ruta_salida_detalle = "01_simulation/output/01_sitios_x_configuracion.xlsx"
     os.makedirs("01_simulation/output", exist_ok=True)
 
     df_sitios_x_configuracion.to_excel(
@@ -498,7 +576,7 @@ if __name__ == "__main__":
 #%%
 # Salida para revision de la demanda proyectada semanal
 
-    ruta_salida_demanda = "01_simulation/output/demanda_proyectada_semanal.xlsx"
+    ruta_salida_demanda = "01_simulation/output/01_demanda_proyectada_semanal.xlsx"
     os.makedirs("01_simulation/output", exist_ok=True)
 
     df_demanda_proyectada_semanal.to_excel(
@@ -512,7 +590,7 @@ if __name__ == "__main__":
 #%%
 # Salida para revision del plan de pedidos
 
-    ruta_salida_pedidos = "01_simulation/output/pedidos_desde_proyeccion.xlsx"
+    ruta_salida_pedidos = "01_simulation/output/01_pedidos_desde_proyeccion.xlsx"
     os.makedirs("01_simulation/output", exist_ok=True)
 
     df_pedidos.to_excel(
@@ -527,7 +605,7 @@ if __name__ == "__main__":
 #%%
 # Salida para revision del detalle con cantidad real
 
-    ruta_salida_real = "01_simulation/output/sitios_x_configuracion_con_real.xlsx"
+    ruta_salida_real = "01_simulation/output/01_sitios_x_configuracion_real.xlsx"
     os.makedirs("01_simulation/output", exist_ok=True)
 
     df_sitios_x_configuracion_real.to_excel(
