@@ -17,7 +17,8 @@
 
 import os
 import uuid
-from datetime import datetime
+import random
+from datetime import datetime, time
 
 import pandas as pd
 
@@ -38,7 +39,47 @@ RUTA_INVENTARIO_SEMANAL_OUT = f"{CARPETA_SALIDA}/02_inventario_semanal.xlsx"
 RUTA_ORDENES_RESUMEN_OUT = f"{CARPETA_SALIDA}/02_ordenes_resumen.xlsx"
 RUTA_ORDENES_DETALLE_OUT = f"{CARPETA_SALIDA}/02_ordenes_detalle.xlsx"
 
-FECHA_PROCESO = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#%% Seleccionar una fecha aleatorio entre el year_week
+
+def random_datetime_in_year_week(year_week: str, seed_key: str | None = None) -> str:
+    """Retorna una fecha aleatoria dentro de la semana ISO indicada por 'YYYY_WW'.
+
+    Regla:
+    - Se toma el lunes ISO de la semana y se suma un offset aleatorio 0..6 días.
+    - La hora se genera aleatoria (0..23), minuto (0..59), segundo (0..59).
+    - Se retorna en formato '%Y-%m-%d %H:%M:%S'.
+
+    Nota:
+    - seed_key permite reproducibilidad. Si se pasa, la aleatoriedad queda fija
+      para el mismo (year_week + seed_key).
+    """
+    if not isinstance(year_week, str) or "_" not in year_week:
+        raise ValueError("year_week debe tener formato 'YYYY_WW' (por ejemplo '2025_01').")
+
+    y_str, w_str = year_week.split("_")
+    year = int(y_str)
+    week = int(w_str)
+
+    # Lunes ISO de la semana
+    monday = pd.to_datetime(f"{year}-W{week:02d}-1", format="%G-W%V-%u").to_pydatetime()
+
+    # Semilla opcional para reproducibilidad
+    if seed_key is not None:
+        rnd = random.Random(f"{year_week}|{seed_key}")
+    else:
+        rnd = random
+
+    day_offset = rnd.randint(0, 6)
+    hour = rnd.randint(0, 23)
+    minute = rnd.randint(0, 59)
+    second = rnd.randint(0, 59)
+
+    dt = monday + pd.Timedelta(days=day_offset)
+    dt = dt.replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 
 
 #%%
@@ -181,8 +222,7 @@ df_ordenes["estado_orden"] = "PENDIENTE"
 df_ordenes["week_primera_reserva"] = pd.NA
 df_ordenes["week_completado"] = pd.NA
 df_ordenes["week_consumido"] = pd.NA
-df_ordenes["fecha_proceso"] = FECHA_PROCESO
-
+df_ordenes["fecha_proceso"] = pd.NA
 
 #%%
 # Construcción del horizonte de simulación
@@ -213,7 +253,7 @@ df_inventario_ref["on_hand"] = 0.0
 df_inventario_ref["reserved"] = 0.0
 df_inventario_ref["available"] = 0.0
 df_inventario_ref["year_week_corte"] = pd.NA
-df_inventario_ref["fecha_proceso"] = FECHA_PROCESO
+df_inventario_ref["fecha_proceso"] = pd.NA
 
 
 #%%
@@ -273,7 +313,10 @@ def add_transaction(
         "id_sitio": id_sitio,
         "origen": origen,
         "comentario": comentario,
-        "fecha_proceso": FECHA_PROCESO,
+        "fecha_proceso":  random_datetime_in_year_week(
+        year_week=year_week,
+        seed_key=f"{tipo_movimiento}|{id_orden}|{id_referencia}|{cantidad}"
+    ),
     }
 
 
@@ -295,7 +338,7 @@ def apply_transaction_to_inventory(df_inv: pd.DataFrame, tx: dict) -> None:
             "reserved": 0.0,
             "available": 0.0,
             "year_week_corte": pd.NA,
-            "fecha_proceso": FECHA_PROCESO,
+            "fecha_proceso":  tx["fecha_proceso"],
         }
         mask = df_inv["id_referencia"] == tx["id_referencia"]
 
@@ -361,7 +404,7 @@ def try_reserve_for_orders(
                 referencia=row["referencia"],
                 unidad=row["unidad"],
                 cantidad=asignar,
-                origen="sitios_x_configuracion_real",
+                origen="Configuracion_Real",
                 id_orden=id_orden,
                 id_sitio=row["id_sitio"],
                 comentario="Reserva parcial o total para orden",
@@ -447,10 +490,10 @@ def consume_completed_orders(
                 referencia=row["referencia"],
                 unidad=row["unidad"],
                 cantidad=qty,
-                origen="sitios_x_configuracion_real",
+                origen="Configuracion_Real",
                 id_orden=id_orden,
                 id_sitio=row["id_sitio"],
-                comentario="Consumo total ejecutado al completar orden",
+                comentario="Despacho a sitio con HW completo",
             )
             transacciones.append(tx)
             apply_transaction_to_inventory(df_inv, tx)
@@ -498,7 +541,7 @@ for wk in horizon_weeks:
                 referencia=row["referencia"],
                 unidad=row["unidad"],
                 cantidad=float(row["cantidad_llegada"]),
-                origen="pedidos_desde_proyeccion",
+                origen="Pedidos",
                 comentario="Ingreso de hardware por pedido",
             )
             transacciones.append(tx)
@@ -574,7 +617,10 @@ for wk in horizon_weeks:
         .merge(movs, on="id_referencia", how="left")
     )
     snap["year_week"] = wk
-    snap["fecha_proceso"] = FECHA_PROCESO
+    snap["fecha_proceso"] = random_datetime_in_year_week(
+        year_week=wk,
+        seed_key=f"SNAP|{wk}"
+    )   
 
     inventario_semanal.append(snap)
 
@@ -612,7 +658,12 @@ df_inventario_semanal = df_inventario_semanal[cols_inv_wk_exist]
 # Ordenes: outputs directos
 df_ordenes_resumen = df_ordenes.copy()
 df_ordenes_detalle_out = df_ordenes_detalle.copy()
-df_ordenes_resumen["fecha_proceso"] = FECHA_PROCESO
+df_ordenes_resumen["fecha_proceso"] = df_ordenes_resumen["year_week_necesidad"].apply(
+    lambda yw: random_datetime_in_year_week(
+        year_week=str(yw),
+        seed_key=f"ORDEN|{yw}"
+    )
+)
 
 
 #%%

@@ -531,9 +531,8 @@ if __name__ == "__main__":
         cobertura_weeks=7
     )
     
-    # Ejecucion de la contaminacion para cantidad real
 
-  # Ejecucion de la contaminacion para cantidad real
+    # Ejecucion de la contaminacion para cantidad real
     df_sitios_x_configuracion_real = contaminar_cantidad_real_por_sitio(
         df_sitios_x_configuracion,
         k_min=2,
