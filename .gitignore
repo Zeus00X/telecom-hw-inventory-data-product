@@ -1,3 +1,4 @@
 # Entorno virtual de Python
 .venv_telecom_hw/
 01_simulation/output/
+.env

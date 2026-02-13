@@ -157,13 +157,28 @@ def build_horizon_year_weeks(min_week_sim: str, max_week_sim: str) -> list[str]:
 #%%
 # Lectura de insumos
 
-df_sitios_real = pd.read_excel(RUTA_SITIOS_REAL)
-df_pedidos = pd.read_excel(RUTA_PEDIDOS)
+from utils.azure_sql_io import build_engine_from_env, read_table
+
+engine = build_engine_from_env()
+
+df_sitios_real = read_table(engine, "stg", "sitios_x_configuracion_real")
+df_pedidos = read_table(engine, "stg", "pedidos_desde_proyeccion")
+
+
+#df_sitios_real = pd.read_excel(RUTA_SITIOS_REAL)
+#df_pedidos = pd.read_excel(RUTA_PEDIDOS)
 
 # Normalización mínima de tipos
 df_sitios_real["year_week"] = df_sitios_real["year_week"].astype(str)
 df_pedidos["year_week_pedido"] = df_pedidos["year_week_pedido"].astype(str)
 df_pedidos["year_week_disponible"] = df_pedidos["year_week_disponible"].astype(str)
+
+
+print(df_sitios_real.shape)
+print(df_pedidos.shape)
+print(df_sitios_real.head(2))
+print(df_pedidos.head(2))
+
 
 
 #%%
@@ -590,7 +605,7 @@ for wk in horizon_weeks:
     })
 
     # Sumar movimientos de la semana desde transacciones
-    df_tx_wk = pd.DataFrame([t for t in transacciones if t["year_week"] == wk])
+    df_tx_wk = pd.DataFrame([t for t in transacciones if t.get("year_week") == wk])
 
     if df_tx_wk.empty:
         movs = pd.DataFrame(columns=[
@@ -602,7 +617,12 @@ for wk in horizon_weeks:
             .groupby(["id_referencia", "tipo_movimiento"], as_index=False)
             .agg(cantidad=("cantidad", "sum"))
         )
-        qtys = qtys.pivot(index="id_referencia", columns="tipo_movimiento", values="cantidad").fillna(0.0).reset_index()
+        qtys = (
+            qtys
+            .pivot(index="id_referencia", columns="tipo_movimiento", values="cantidad")
+            .fillna(0.0)
+            .reset_index()
+        )
         movs = qtys.rename(columns={
             "LLEGADA": "llegadas_qty_semana",
             "RESERVA": "reservas_qty_semana",
@@ -620,12 +640,48 @@ for wk in horizon_weeks:
     snap["fecha_proceso"] = random_datetime_in_year_week(
         year_week=wk,
         seed_key=f"SNAP|{wk}"
-    )   
+    )
 
     inventario_semanal.append(snap)
 
     # Corte procesado
     df_inventario_ref["year_week_corte"] = wk
+
+    # ------------------------------------------------------------
+    # CIERRE DE SEMANA: Generar CSV de transacciones y subir a Data Lake (overwrite)
+    # ------------------------------------------------------------
+    # Importante: asume que ya tienes:
+    #   from utils.datalake_io import upload_df_as_csv
+    # y que transacciones es una lista de dicts.
+
+    tx_cols = [
+        "year_week", "tipo_movimiento",
+        "id_referencia", "referencia", "unidad",
+        "cantidad", "origen", "comentario"
+    ]
+
+    if df_tx_wk.empty:
+        df_tx_wk_export = pd.DataFrame(columns=tx_cols)
+    else:
+        df_tx_wk_export = df_tx_wk.copy()
+        for c in tx_cols:
+            if c not in df_tx_wk_export.columns:
+                df_tx_wk_export[c] = None
+        df_tx_wk_export = df_tx_wk_export[tx_cols]
+
+    year_str, week_str = wk.split("_")
+    year = int(year_str)
+    week = int(week_str)
+
+    blob_path = (
+        f"telecom-hw/inventory_simulation/transacciones/"
+        f"year={year}/week={week:02d}/"
+        f"transacciones_{year}_{week:02d}.csv"
+    )
+
+    upload_df_as_csv(df_tx_wk_export, blob_path)
+    print(f"[OK] CSV semana {wk} subido (overwrite): {blob_path}")
+
 
 
 #%%

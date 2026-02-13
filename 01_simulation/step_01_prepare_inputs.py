@@ -637,7 +637,7 @@ if __name__ == "__main__":
     # 01_pedidos_desde_proyeccion -> stg.pedidos_desde_proyeccion
     truncate_and_load(
         engine=engine,
-        df=df_pedidos_desde_proyeccion,
+        df=df_pedidos,
         schema="stg",
         table="pedidos_desde_proyeccion"
     )
