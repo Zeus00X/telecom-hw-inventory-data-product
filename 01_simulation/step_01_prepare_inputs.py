@@ -615,5 +615,32 @@ if __name__ == "__main__":
 
     print(f"\nArchivo exportado en {ruta_salida_real}")
 
+#%%
+# Envio a base de datos en Azure  
+    from utils.azure_sql_io import build_engine, truncate_and_load
 
+    SERVER = "sqltelecomhwdevsa01.database.windows.net"
+    DATABASE = "db_telecom_hw"
+    USERNAME = "adminsql"
+    PASSWORD = "Portafolio,1#portafolio"
+
+    engine = build_engine(SERVER, DATABASE, USERNAME, PASSWORD)
+
+    # 01_sitios_x_configuracion_real  -> stg.sitios_x_configuracion_real
+    truncate_and_load(
+        engine=engine,
+        df=df_sitios_x_configuracion_real,
+        schema="stg",
+        table="sitios_x_configuracion_real"
+    )
+
+    # 01_pedidos_desde_proyeccion -> stg.pedidos_desde_proyeccion
+    truncate_and_load(
+        engine=engine,
+        df=df_pedidos_desde_proyeccion,
+        schema="stg",
+        table="pedidos_desde_proyeccion"
+    )
+
+    print("✅ Script 1: XLSX exportado + tablas staging actualizadas en Azure SQL.")
 
