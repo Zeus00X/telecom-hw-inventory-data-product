@@ -653,6 +653,7 @@ for wk in horizon_weeks:
     # Importante: asume que ya tienes:
     #   from utils.datalake_io import upload_df_as_csv
     # y que transacciones es una lista de dicts.
+    from utils.azure_datalake_io import upload_df_as_csv
 
     tx_cols = [
         "year_week", "tipo_movimiento",
