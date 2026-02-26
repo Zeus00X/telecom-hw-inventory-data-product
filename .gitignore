@@ -2,3 +2,4 @@
 .venv_telecom_hw/
 01_simulation/output/
 .env
+local.settings.json
